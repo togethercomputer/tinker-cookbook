@@ -3,16 +3,21 @@
 ## Installation
 
 ```bash
-uv pip install 'tinker-cookbook[modal] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+uv pip install 'tinker-cookbook[together] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+export TOGETHER_API_KEY=...   # required for the Together Sandbox SDK
 ```
 
-RL training on Harbor formatted tasks (e.g., Terminal Bench 2.0) with sandboxed code execution. An agent gets a bash tool inside a sandboxed container, attempts a task, and receives reward based on test results.
+Set `TOGETHER_LOCAL_BUILD=1` if you have Docker installed locally and prefer building images on your machine instead of remotely on Together's infrastructure.
+
+RL training on Harbor formatted tasks (e.g., Terminal Bench 2.0) with sandboxed code execution. An agent gets a bash tool inside a sandboxed container, attempts a task, and receives reward based on test results. Sandboxes are provisioned via the [Together Sandbox SDK](https://github.com/togethercomputer/together-sandbox).
 
 ## HarborTask
+
 Harbor offers a standardized format for SWE/Terminal-Bench style task.
 Adhering to this allows seperation between task creation layer and evaluation/training harness layer.
 We can download the harbor datasets through `uvx harbor datasets download terminal-bench@2.0`.
 By default, the task will land in `~/.cache/harbor/tasks/` with the structure
+
 ```
 ~/.cache/harbor/tasks/
   └── <shortuuid(task_id)>/       # deterministic hash for deduplication
@@ -25,6 +30,7 @@ By default, the task will land in `~/.cache/harbor/tasks/` with the structure
           ├── task.toml
           └── solution/
 ```
+
 To use harbor tasks for training or evaluation, we designed the following interface
 
 ```python
@@ -45,6 +51,7 @@ tasks = load_harbor_tasks()  # reads from ~/.cache/harbor/tasks/ by default
 print(f"Loaded {len(tasks)} tasks")
 print(tasks[0].task_name, tasks[0].task_dir)
 ```
+
 The training environment is implemented against this interface.
 You can customize your own task as long as they conforms to the interface above.
 
@@ -64,26 +71,41 @@ class SandboxInterface(Protocol):
     async def cleanup(self) -> None: ...
 ```
 
-`ModalSandbox` implements this interface.
+`TogetherSandboxWrapper` (in `tinker_cookbook/sandbox/together_sandbox.py`) implements this interface.
 
 ### SandboxFactory and injection
 
-`harbor_env.py` defines a backend-agnostic factory type and a default Modal implementation:
+`harbor_env.py` defines a backend-agnostic factory type and a default Together implementation:
 
 ```python
-SandboxFactory = Callable[[Path, int], Awaitable[SandboxInterface]]
+SandboxFactory = Callable[..., Awaitable[SandboxInterface]]
 
-async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterface:
-    """Create a Modal sandbox from a task environment directory."""
-    import modal
-    dockerfile_path = env_dir / "Dockerfile"
-    image = modal.Image.from_dockerfile(path=str(dockerfile_path), context_dir=str(env_dir))
-    return await ModalSandbox.create(image=image, timeout=timeout)
+async def default_sandbox_factory(
+    env_dir: Path,
+    timeout: int,
+    *,
+    cpu_millicores: int | None = None,
+    memory_mb: int | None = None,
+    disk_gb: int | None = None,
+) -> SandboxInterface:
+    """Create a Together sandbox from a task environment directory."""
+    from tinker_cookbook.sandbox.together_sandbox import TogetherSandboxWrapper
+    return await TogetherSandboxWrapper.create(
+        env_dir=env_dir,
+        timeout=timeout,
+        cpu_millicores=cpu_millicores,
+        memory_mb=memory_mb,
+        disk_gb=disk_gb,
+    )
 ```
 
-The first argument is the task's `environment/` directory (containing a Dockerfile and build context). Each backend converts this to its own image format internally (e.g. Modal builds a `modal.Image`).
+The first argument is the task's `environment/` directory (containing a Dockerfile and build context). Each backend converts this to its own image format internally (Together builds and registers a snapshot under a content-addressed alias, so repeated `create()` calls for the same Dockerfile reuse the cached image instead of rebuilding).
 
-`cli_main()` accepts an optional `sandbox_factory` parameter. When `None`, it falls back to `default_sandbox_factory` (Modal). The factory flows through: `cli_main` -> `HarborDatasetBuilder` -> `HarborEnvGroupBuilder.make_envs()`.
+`cpu_millicores` / `memory_mb` / `disk_gb` are also exposed on `HarborEnvGroupBuilder` and `HarborDatasetBuilder` so you can override Together's defaults (1000mC / 2048MB / 10GB) for resource-hungry tasks like SWE-Bench. Leave them as `None` to accept the defaults.
+
+`cli_main()` accepts an optional `sandbox_factory` parameter. When `None`, it falls back to `default_sandbox_factory` (Together). The factory flows through: `cli_main` -> `HarborDatasetBuilder` -> `HarborEnvGroupBuilder.make_envs()`.
+
+Together has no native VM-lifetime cap, so the wrapper schedules an in-process watchdog that calls `shutdown()` after `sandbox_timeout` seconds — always call `cleanup()` (already wired into `HarborEnvGroupBuilder.cleanup()` and `eval.py`'s finally-blocks) to release sandboxes promptly.
 
 ## Running
 
@@ -104,12 +126,14 @@ uv run python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py
 Evaluate a Tinker endpoint on Harbor datasets without training.
 
 Download datasets:
+
 ```bash
 uvx harbor datasets download terminal-bench@2.0 -o ~/.cache/harbor/tasks/terminal-bench-2.0
 uvx harbor datasets download swebench-verified@1.0 -o ~/.cache/harbor/tasks/swebench-verified-1.0
 ```
 
 Run evaluation:
+
 ```bash
 uv run python tinker_cookbook/recipes/harbor_rl/scripts/eval_terminal_bench.py
 ```
@@ -121,10 +145,10 @@ We evaluated SWE-Bench-Verified-1.0 and Terminal-Bench-2.0 at 32K context length
 
 ### Results: Kimi-K2-Thinking (32K context, no compaction)
 
-| Benchmark | Total | PASS | FAIL | ERROR | Pass Rate |
-|-----------|-------|------|------|-------|-----------|
-| SWE-Bench Verified 1.0 | 500 | 46 (9.2%) | 52 (10.4%) | 402 (80.4%) | 9.2% |
-| Terminal-Bench 2.0 | 89 | 18 (20.2%) | 36 (40.4%) | 35 (39.3%) | 20.2% |
+| Benchmark              | Total | PASS       | FAIL       | ERROR       | Pass Rate |
+| ---------------------- | ----- | ---------- | ---------- | ----------- | --------- |
+| SWE-Bench Verified 1.0 | 500   | 46 (9.2%)  | 52 (10.4%) | 402 (80.4%) | 9.2%      |
+| Terminal-Bench 2.0     | 89    | 18 (20.2%) | 36 (40.4%) | 35 (39.3%)  | 20.2%     |
 
 **Config**: `max_turns=200, max_tokens=8192, temperature=0.1, sandbox_timeout=3600s`
 

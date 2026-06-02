@@ -17,7 +17,6 @@ from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.sandbox import SandboxInterface
-from tinker_cookbook.sandbox.modal_sandbox import ModalSandbox
 from tinker_cookbook.tool_use import build_agent_tool_env
 from tinker_cookbook.tool_use.agent_tool_message_env import RewardFn
 
@@ -30,21 +29,42 @@ HARBOR_SYSTEM_PROMPT = (
     "Complete the task described by the user."
 )
 
-SandboxFactory = Callable[[Path, int], Awaitable[SandboxInterface]]
+# SandboxFactory is intentionally typed as Callable[..., ...] (rather than a
+# fixed positional signature) so backends can accept additional resource
+# kwargs (cpu/memory/disk) without breaking callers that don't supply them.
+SandboxFactory = Callable[..., Awaitable[SandboxInterface]]
 
 
-async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterface:
-    """Create a Modal sandbox from a task environment directory.
+async def default_sandbox_factory(
+    env_dir: Path,
+    timeout: int,
+    *,
+    cpu_millicores: int | None = None,
+    memory_mb: int | None = None,
+    disk_gb: int | None = None,
+) -> SandboxInterface:
+    """Create a Together sandbox from a task environment directory.
+
+    Snapshots are cached on Together's registry under a hash of the build
+    context, so re-creating sandboxes for the same task reuses the same image
+    without rebuilding.
 
     Args:
         env_dir: Path to the task's environment/ directory (must contain a Dockerfile).
-        timeout: Sandbox lifetime in seconds.
+        timeout: Sandbox lifetime in seconds (enforced by an in-process watchdog).
+        cpu_millicores: CPU allocation. None uses Together's default (1000mC).
+        memory_mb: Memory allocation in MB. None uses Together's default (2048).
+        disk_gb: Disk allocation in GB. None uses Together's default (10).
     """
-    import modal
+    from tinker_cookbook.sandbox.together_sandbox import TogetherSandboxWrapper
 
-    dockerfile_path = env_dir / "Dockerfile"
-    image = modal.Image.from_dockerfile(path=str(dockerfile_path), context_dir=str(env_dir))
-    return await ModalSandbox.create(image=image, timeout=timeout)
+    return await TogetherSandboxWrapper.create(
+        env_dir=env_dir,
+        timeout=timeout,
+        cpu_millicores=cpu_millicores,
+        memory_mb=memory_mb,
+        disk_gb=disk_gb,
+    )
 
 
 @dataclass(frozen=True)
@@ -91,7 +111,13 @@ def _initial_messages(
 
 
 class HarborEnvGroupBuilder(EnvGroupBuilder):
-    """EnvGroupBuilder that creates Harbor environments with Modal sandboxes."""
+    """EnvGroupBuilder that creates Harbor environments with Together sandboxes.
+
+    Resource allocation for the underlying sandbox (CPU/memory/disk) is
+    configurable via the ``cpu_millicores`` / ``memory_mb`` / ``disk_gb``
+    fields, which are forwarded to the sandbox factory. Leaving them as
+    ``None`` accepts the backend's defaults (Together: 1000mC / 2048MB / 10GB).
+    """
 
     def __init__(
         self,
@@ -108,6 +134,9 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
         context_overflow_reward: float = -0.1,
         sandbox_factory: SandboxFactory | None = None,
         reward_fn: RewardFn | None = None,
+        cpu_millicores: int | None = None,
+        memory_mb: int | None = None,
+        disk_gb: int | None = None,
     ):
         self.task = task
         self.model_name = model_name
@@ -122,6 +151,9 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
         self.context_overflow_reward = context_overflow_reward
         self.sandbox_factory = sandbox_factory or default_sandbox_factory
         self.reward_fn = reward_fn
+        self.cpu_millicores = cpu_millicores
+        self.memory_mb = memory_mb
+        self.disk_gb = disk_gb
         self._sandboxes: list[SandboxInterface] = []
 
     async def make_envs(self) -> Sequence[Env]:
@@ -140,7 +172,13 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
 
         envs = []
         for _ in range(self.group_size):
-            sandbox = await self.sandbox_factory(env_dir, self.sandbox_timeout)
+            sandbox = await self.sandbox_factory(
+                env_dir,
+                self.sandbox_timeout,
+                cpu_millicores=self.cpu_millicores,
+                memory_mb=self.memory_mb,
+                disk_gb=self.disk_gb,
+            )
             self._sandboxes.append(sandbox)
 
             bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
@@ -213,6 +251,9 @@ class HarborDatasetBuilder(RLDatasetBuilder):
     context_overflow_reward: float = -0.1
     sandbox_factory: SandboxFactory | None = None
     reward_fn: RewardFn | None = None
+    cpu_millicores: int | None = None
+    memory_mb: int | None = None
+    disk_gb: int | None = None
 
     def _make_env_group_builders(self, group_size: int) -> list[HarborEnvGroupBuilder]:
         return [
@@ -230,6 +271,9 @@ class HarborDatasetBuilder(RLDatasetBuilder):
                 context_overflow_reward=self.context_overflow_reward,
                 sandbox_factory=self.sandbox_factory,
                 reward_fn=self.reward_fn,
+                cpu_millicores=self.cpu_millicores,
+                memory_mb=self.memory_mb,
+                disk_gb=self.disk_gb,
             )
             for task in self.tasks
         ]
