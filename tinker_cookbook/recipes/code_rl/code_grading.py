@@ -1,9 +1,10 @@
 """
 Code grading utilities for RL training.
 
-Supports two execution backends:
+Supports three execution backends:
 - sandboxfusion: Local Docker-based sandbox (default)
 - modal: Cloud-based Modal sandbox
+- together: Cloud-based Together Sandbox
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from tinker_cookbook.sandbox import SandboxBackend, SandboxFusionClient
 # Global sandbox backend clients (lazily initialized)
 _sandboxfusion_client: SandboxFusionClient | None = None
 _modal_pool: Any = None  # ModalSandboxPool, but avoid import at module level
+_together_pool: Any = None  # TogetherSandboxPool, but avoid import at module level
 
 
 def _get_sandboxfusion_client() -> SandboxFusionClient:
@@ -39,6 +41,30 @@ def _get_modal_pool():
         image = modal.Image.debian_slim().pip_install("numpy")
         _modal_pool = ModalSandboxPool(image=image)
     return _modal_pool
+
+
+def _get_together_pool():
+    """Get or create the Together sandbox pool."""
+    global _together_pool
+    if _together_pool is None:
+        import asyncio
+        import signal
+
+        from tinker_cookbook.sandbox.together_sandbox import TogetherSandboxPool
+
+        _together_pool = TogetherSandboxPool()
+
+        def _shutdown_pool() -> None:
+            if _together_pool is not None:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_together_pool.terminate())
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop = asyncio.get_event_loop()
+            loop.add_signal_handler(sig, _shutdown_pool)
+
+    return _together_pool
 
 
 def extract_code_from_model(model_response: str) -> str | None:
@@ -116,6 +142,31 @@ async def _check_with_modal(
     }
 
 
+async def _check_with_together(
+    test_cases: dict[str, str],
+    generation: str,
+    timeout: int,
+    total_timeout: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Execute tests using Together sandbox."""
+    pool = _get_together_pool()
+    result = await pool.run_in_workdir(
+        files={
+            "test_cases.txt": json.dumps(test_cases),
+            "code.py": generation,
+            "testing_util.py": TEST_UTIL,
+            "run.py": TEST_CODE % {"timeout": timeout},
+        },
+        command=["python", "run.py"],
+        timeout=total_timeout,
+    )
+    return result.exit_code == 0, {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 async def sandbox_check_correctness(
     sample: list[dict[str, Any]],
     generation: str,
@@ -148,6 +199,8 @@ async def sandbox_check_correctness(
             return await _check_with_modal(test_cases, generation, timeout, total_timeout)
         elif use_backend == SandboxBackend.SANDBOXFUSION:
             return await _check_with_sandboxfusion(test_cases, generation, timeout, total_timeout)
+        elif use_backend == SandboxBackend.TOGETHER:
+            return await _check_with_together(test_cases, generation, timeout, total_timeout)
         else:
             raise ValueError(f"Invalid sandbox backend: {use_backend}")
 

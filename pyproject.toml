@@ -50,6 +50,9 @@ math-rl = [
 modal = [
     "modal>=1.0.0",
 ]
+together-sandbox = [
+    "together-sandbox>=2.0.0",
+]
 multiplayer-rl = [
     "textarena>=0.7.4",
 ]
