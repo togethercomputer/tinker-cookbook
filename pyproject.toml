@@ -51,7 +51,7 @@ modal = [
     "modal>=1.0.0",
 ]
 together = [
-    "together-sandbox>=0.1.0",
+    "together-sandbox>=2.0.0",
 ]
 multiplayer-rl = [
     "textarena>=0.7.4",
