@@ -78,18 +78,30 @@ class HarborTask:
 
 
 def load_harbor_tasks(dataset: str) -> list[HarborTask]:
-    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/."""
+    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/.
+
+    Handles both flat layouts (task files directly in task_dir) and nested
+    layouts where each entry contains a single named subdirectory
+    (e.g. <hash>/<task-name>/instruction.md).
+    """
     tasks_dir = HARBOR_CACHE_DIR / dataset
     tasks: list[HarborTask] = []
-    for task_dir in sorted(tasks_dir.iterdir()):
-        if not task_dir.is_dir():
+    for entry in sorted(tasks_dir.iterdir()):
+        if not entry.is_dir():
             continue
+        # Nested layout: <hash>/<task-name>/
+        if not (entry / "instruction.md").exists():
+            subdirs = [d for d in entry.iterdir() if d.is_dir()]
+            if len(subdirs) == 1:
+                entry = subdirs[0]
+            else:
+                continue
         tasks.append(
             HarborTask(
-                task_name=task_dir.name,
-                instruction=(task_dir / "instruction.md").read_text(),
-                task_dir=task_dir,
-                config=tomllib.loads((task_dir / "task.toml").read_text()),
+                task_name=entry.name,
+                instruction=(entry / "instruction.md").read_text(),
+                task_dir=entry,
+                config=tomllib.loads((entry / "task.toml").read_text()),
             )
         )
     tasks.sort(key=lambda t: t.task_name)

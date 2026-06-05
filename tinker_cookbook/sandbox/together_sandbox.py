@@ -110,9 +110,8 @@ async def _ensure_snapshot(sdk: "ts.TogetherSandbox", env_dir: Path, alias: str)
                 "Reusing cached Together snapshot %s for alias %s", existing.id, alias
             )
             return existing.id
-        except ts.HttpError as e:
-            if getattr(e, "status", None) not in (404, 410):
-                raise
+        except Exception:
+            pass  # Alias not found — fall through to build
 
         dockerfile = env_dir / "Dockerfile"
         logger.info("Building Together snapshot for %s (alias=%s)", env_dir, alias)
@@ -270,7 +269,7 @@ class TogetherSandboxWrapper:
                 self._sandbox.execs.exec(
                     "bash",
                     ["-lc", command],
-                    cwd=workdir or "/",
+                    cwd=workdir,
                 ),
                 timeout=timeout,
             )
@@ -376,4 +375,4 @@ class TogetherSandboxWrapper:
                 await self._watchdog
 
         with contextlib.suppress(Exception):
-            await self._sandbox.shutdown()
+            await self._sdk.sandboxes.shutdown(self._sandbox_id)
