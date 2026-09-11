@@ -6,7 +6,7 @@ and port forwarding. Each sandbox is backed by a *snapshot* — an immutable dis
 image built from a Dockerfile context.
 
 Requires:
-    pip install together-sandbox
+    pip install 'together-sandbox>=4.0.3'
     export TOGETHER_API_KEY=...
 
 Optional environment variables:
@@ -20,13 +20,14 @@ Sandboxes are created via a content-addressed alias on Together's snapshot
 registry. Calling ``create()`` for a Dockerfile context that already has a
 registered snapshot reuses it instead of rebuilding — this is the single most
 important optimization for RL training, where many sandboxes per epoch share
-the same task image.
+the same task image. Builds additionally pass a stable ``cache_key`` so the
+remote builder can reuse layers across rebuilds.
 
 Lifetime
 --------
-Together has no native VM lifetime cap, so a watchdog coroutine forces
-``shutdown()`` after ``timeout`` seconds. Always call ``cleanup()`` explicitly
-to release resources promptly and cancel the watchdog.
+Sandboxes are created with a server-side ``ttl``, so they are reclaimed even if
+the training process dies. Always call ``cleanup()`` explicitly to release
+resources promptly rather than waiting for the TTL.
 
 See: https://github.com/togethercomputer/together-sandbox
 """
@@ -35,8 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import getpass
 import hashlib
 import logging
+import os
+import posixpath
 from pathlib import Path
 from typing import Any
 
@@ -60,11 +64,45 @@ logger = logging.getLogger(__name__)
 # Cached snapshot aliases live under this prefix on Together's registry.
 SNAPSHOT_ALIAS_PREFIX = "tinker-cookbook-harbor"
 
+def _default_tags() -> dict[str, str]:
+    """Tags attached to every sandbox and snapshot, for cost attribution.
+
+    ``user`` defaults to the OS login name; override it with
+    ``TINKER_SANDBOX_USER`` when running under a shared service account.
+    """
+    user = os.environ.get("TINKER_SANDBOX_USER") or getpass.getuser()
+    return {"user": user, "job": "tinker", "component": "tinker-cookbook"}
+
+
 # Locks for de-duplicating concurrent snapshot builds within a single process.
 # When multiple sandboxes for the same task spin up in parallel (e.g. group_size
 # rollouts), only the first one builds; the others wait and reuse the result.
 _snapshot_build_locks: dict[str, asyncio.Lock] = {}
 _snapshot_build_locks_mu = asyncio.Lock()
+
+# One management-API client per process. Each client owns an httpx connection
+# pool, so creating one per sandbox would leak sockets across an RL run.
+_sdk: "ts.TogetherSandbox | None" = None
+_sdk_mu = asyncio.Lock()
+
+
+async def _get_sdk() -> "ts.TogetherSandbox":
+    """Return the process-wide SDK client, creating it on first use."""
+    global _sdk
+    async with _sdk_mu:
+        if _sdk is None:
+            _sdk = ts.TogetherSandbox()  # reads TOGETHER_API_KEY from env
+        return _sdk
+
+
+async def close_sdk() -> None:
+    """Close the process-wide SDK client. Safe to call more than once."""
+    global _sdk
+    async with _sdk_mu:
+        if _sdk is not None:
+            with contextlib.suppress(Exception):
+                await _sdk.close()
+            _sdk = None
 
 
 def _hash_build_context(env_dir: Path) -> str:
@@ -87,13 +125,25 @@ def _hash_build_context(env_dir: Path) -> str:
 
 def _is_sandbox_terminated(exc: BaseException) -> bool:
     """Check if an exception indicates the sandbox has died."""
-    if isinstance(exc, ts.HttpError) and getattr(exc, "status", None) in (404, 410):
+    if isinstance(exc, ts.HttpError) and exc.status in (404, 410):
         return True
     msg = str(exc).lower()
-    return any(keyword in msg for keyword in ("terminated", "died", "not found"))
+    return any(
+        keyword in msg
+        for keyword in (
+            "terminated",
+            "died",
+            "not found",
+            # SDK raises this when an exec's SSE stream ends without an exit
+            # code, which happens when the VM goes away mid-command.
+            "stream ended without an exit code",
+        )
+    )
 
 
-async def _ensure_snapshot(sdk: "ts.TogetherSandbox", env_dir: Path, alias: str) -> str:
+async def _ensure_snapshot(
+    sdk: "ts.TogetherSandbox", env_dir: Path, alias: str, tags: dict[str, str]
+) -> str:
     """Look up a snapshot by alias; build one if it doesn't exist.
 
     Concurrent calls for the same alias serialize on an in-process lock so we
@@ -106,12 +156,12 @@ async def _ensure_snapshot(sdk: "ts.TogetherSandbox", env_dir: Path, alias: str)
         # Re-check after acquiring the lock — another coroutine may have built it.
         try:
             existing = await sdk.snapshots.get_by_alias(alias)
-            logger.info(
-                "Reusing cached Together snapshot %s for alias %s", existing.id, alias
-            )
-            return existing.id
-        except Exception:
-            pass  # Alias not found — fall through to build
+            logger.info("Reusing cached Together snapshot %s for alias %s", existing.id, alias)
+            return str(existing.id)
+        except ts.HttpError as e:
+            if e.status != 404:
+                raise
+            # Alias not registered yet — fall through to build.
 
         dockerfile = env_dir / "Dockerfile"
         logger.info("Building Together snapshot for %s (alias=%s)", env_dir, alias)
@@ -120,9 +170,11 @@ async def _ensure_snapshot(sdk: "ts.TogetherSandbox", env_dir: Path, alias: str)
                 context=str(env_dir),
                 dockerfile=str(dockerfile),
                 alias=alias,
-                on_progress=lambda event: logger.debug(
-                    "snapshot build: %s", getattr(event, "output", event)
-                ),
+                tags=tags,
+                # Snapshots build under a generated image name, so without an
+                # explicit key the remote builder's layer cache never hits.
+                cache_key=f"{SNAPSHOT_ALIAS_PREFIX}/{alias}",
+                on_progress=lambda event: logger.debug("snapshot build: %s", event.output),
             )
         )
         return result.snapshot_id
@@ -142,40 +194,42 @@ class TogetherSandboxWrapper:
     def __init__(
         self,
         sdk: "ts.TogetherSandbox",
-        sandbox: Any,
-        sandbox_id: str,
+        sandbox: "ts.Sandbox",
         snapshot_id: str,
         timeout: int,
         max_stream_output_bytes: int = 128 * 1024,
     ) -> None:
         self._sdk = sdk
         self._sandbox = sandbox
-        self._sandbox_id = sandbox_id
+        self._sandbox_id = sandbox.id
         self._snapshot_id = snapshot_id
         self._timeout = timeout
         self._max_stream_output_bytes = max_stream_output_bytes
         self._closed = False
-        self._watchdog: asyncio.Task[None] | None = None
 
     @classmethod
     async def create(
         cls,
         env_dir: Path,
         timeout: int = 600,
-        cpu_millicores: int | None = None,
-        memory_mb: int | None = None,
-        disk_gb: int | None = None,
+        cpu_cores: float | None = None,
+        memory_bytes: int | None = None,
         max_stream_output_bytes: int = 128 * 1024,
+        tags: dict[str, str] | None = None,
     ) -> TogetherSandboxWrapper:
         """Create a new Together sandbox from a Dockerfile build context.
 
         Args:
             env_dir: Directory containing ``Dockerfile`` and build context.
-            timeout: Sandbox lifetime in seconds (enforced by an in-process watchdog).
-            cpu_millicores: CPU allocation. ``None`` uses Together's default (1000mC).
-            memory_mb: Memory allocation in MB. ``None`` uses Together's default (2048).
-            disk_gb: Disk allocation in GB. ``None`` uses Together's default (10).
+            timeout: Sandbox lifetime in seconds, enforced server-side as a TTL.
+            cpu_cores: CPU allocation in cores (0.1–16). ``None`` uses Together's
+                default (1 vCPU).
+            memory_bytes: Memory allocation in bytes, between 1 GB and 8 GB per
+                requested core. ``None`` uses Together's default (2 GiB).
             max_stream_output_bytes: Default cap for command output streams.
+            tags: Extra key/value labels for the sandbox and its snapshot, merged
+                over the defaults from ``_default_tags()``. Useful for
+                attributing spend to a recipe or task.
         """
         dockerfile = env_dir / "Dockerfile"
         if not dockerfile.is_file():
@@ -184,53 +238,39 @@ class TogetherSandboxWrapper:
                 "Together backend requires environment/Dockerfile."
             )
 
-        sdk = ts.TogetherSandbox()  # reads TOGETHER_API_KEY from env
+        sdk = await _get_sdk()
         alias = f"{SNAPSHOT_ALIAS_PREFIX}-{_hash_build_context(env_dir)}"
-        snapshot_id = await _ensure_snapshot(sdk, env_dir, alias)
+        all_tags = {**_default_tags(), **(tags or {})}
+        snapshot_id = await _ensure_snapshot(sdk, env_dir, alias, all_tags)
 
         # Only include resource overrides the caller specified, so we accept
-        # Together's defaults otherwise.
-        create_kwargs: dict[str, Any] = {"snapshot_id": snapshot_id}
-        if cpu_millicores is not None:
-            create_kwargs["cpu"] = cpu_millicores
-        if memory_mb is not None:
-            create_kwargs["memory"] = memory_mb
-        if disk_gb is not None:
-            create_kwargs["disk"] = disk_gb
+        # Together's defaults otherwise. Omitting termination_policy makes the
+        # sandbox ephemeral: no snapshot is kept when it goes away.
+        create_kwargs: dict[str, Any] = {
+            "snapshot_id": snapshot_id,
+            "ttl": timeout,
+            "tags": all_tags,
+        }
+        if cpu_cores is not None:
+            create_kwargs["cpu"] = cpu_cores
+        if memory_bytes is not None:
+            create_kwargs["memory_bytes"] = memory_bytes
 
-        sandbox_model = await sdk.sandboxes.create(**create_kwargs)
-        sandbox = await sdk.sandboxes.start(sandbox_model.id)
+        # create() starts the VM and returns once it is running — there is no
+        # separate start step in the v4 SDK.
+        sandbox = await sdk.sandboxes.create(**create_kwargs)
 
-        wrapper = cls(
+        return cls(
             sdk=sdk,
             sandbox=sandbox,
-            sandbox_id=sandbox_model.id,
             snapshot_id=snapshot_id,
             timeout=timeout,
             max_stream_output_bytes=max_stream_output_bytes,
         )
-        wrapper._watchdog = asyncio.create_task(wrapper._auto_shutdown())
-        return wrapper
 
     @property
     def sandbox_id(self) -> str:
         return self._sandbox_id
-
-    async def _auto_shutdown(self) -> None:
-        """Force shutdown after ``timeout`` seconds — Together has no native VM timeout."""
-        try:
-            await asyncio.sleep(self._timeout)
-        except asyncio.CancelledError:
-            return
-        if self._closed:
-            return
-        logger.warning(
-            "Together sandbox %s exceeded lifetime of %ds — forcing shutdown",
-            self._sandbox_id,
-            self._timeout,
-        )
-        with contextlib.suppress(Exception):
-            await self.cleanup()
 
     async def send_heartbeat(self, timeout: int = 30) -> None:
         """No-op heartbeat: Together has no explicit liveness check, so we run ``true``."""
@@ -259,11 +299,7 @@ class TogetherSandboxWrapper:
         we place it in ``SandboxResult.stdout`` and leave ``stderr`` empty.
         Apply ``max_output_bytes`` as a post-hoc truncation.
         """
-        cap = (
-            max_output_bytes
-            if max_output_bytes is not None
-            else self._max_stream_output_bytes
-        )
+        cap = max_output_bytes if max_output_bytes is not None else self._max_stream_output_bytes
         try:
             result = await asyncio.wait_for(
                 self._sandbox.execs.exec(
@@ -276,10 +312,13 @@ class TogetherSandboxWrapper:
             output = result.get("output", "") or ""
             if cap is not None and len(output) > cap:
                 output = output[:cap]
+            # Compare against None rather than using `or`: a successful command
+            # reports exit_code 0, which is falsy.
+            exit_code = result.get("exit_code")
             return SandboxResult(
                 stdout=output,
                 stderr="",
-                exit_code=int(result.get("exit_code", -1) or -1),
+                exit_code=-1 if exit_code is None else int(exit_code),
             )
         except asyncio.TimeoutError:
             return SandboxResult(
@@ -295,9 +334,7 @@ class TogetherSandboxWrapper:
     ) -> SandboxResult:
         """Read a file from the sandbox."""
         try:
-            content = await asyncio.wait_for(
-                self._sandbox.files.read(path), timeout=timeout
-            )
+            content = await asyncio.wait_for(self._sandbox.files.read(path), timeout=timeout)
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
             if max_bytes is not None and len(content) > max_bytes:
@@ -308,10 +345,8 @@ class TogetherSandboxWrapper:
                 stdout="", stderr=f"read_file timed out after {timeout}s", exit_code=-1
             )
         except ts.HttpError as e:
-            if getattr(e, "status", None) == 404:
-                return SandboxResult(
-                    stdout="", stderr=f"file not found: {path}", exit_code=1
-                )
+            if e.status == 404:
+                return SandboxResult(stdout="", stderr=f"file not found: {path}", exit_code=1)
             if _is_sandbox_terminated(e):
                 raise SandboxTerminatedError(str(e)) from e
             return SandboxResult(stdout="", stderr=str(e), exit_code=1)
@@ -329,10 +364,17 @@ class TogetherSandboxWrapper:
     ) -> SandboxResult:
         """Write content to a file in the sandbox.
 
+        Creates the parent directory first, since ``files.create`` does not.
         Together's files API has no ``executable`` flag, so when requested we
         follow up with ``chmod +x`` via exec.
         """
         try:
+            parent = posixpath.dirname(path)
+            if parent not in ("", "/"):
+                with contextlib.suppress(ts.HttpError):
+                    await asyncio.wait_for(
+                        self._sandbox.directories.create(parent), timeout=timeout
+                    )
             await asyncio.wait_for(
                 self._sandbox.files.create(path, content),
                 timeout=timeout,
@@ -342,7 +384,8 @@ class TogetherSandboxWrapper:
                     self._sandbox.execs.exec("chmod", ["+x", path]),
                     timeout=timeout,
                 )
-                exit_code = int(result.get("exit_code", 0) or 0)
+                chmod_code = result.get("exit_code")
+                exit_code = 0 if chmod_code is None else int(chmod_code)
                 if exit_code != 0:
                     return SandboxResult(
                         stdout="",
@@ -360,19 +403,18 @@ class TogetherSandboxWrapper:
             return SandboxResult(stdout="", stderr=str(e), exit_code=-1)
 
     async def cleanup(self) -> None:
-        """Shut down the sandbox VM and cancel the lifetime watchdog.
+        """Terminate the sandbox VM and close its agent connection.
 
-        Snapshots are intentionally *not* deleted — they are cached for reuse
+        Snapshots are intentionally *not* retired — they are cached for reuse
         by sibling sandboxes (same task, different rollout) and across runs.
+        Termination is final; the sandbox cannot be restarted afterwards.
         """
         if self._closed:
             return
         self._closed = True
 
-        if self._watchdog is not None and not self._watchdog.done():
-            self._watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._watchdog
-
         with contextlib.suppress(Exception):
-            await self._sdk.sandboxes.shutdown(self._sandbox_id)
+            # snapshot=None makes the teardown ephemeral (no snapshot kept).
+            await self._sdk.sandboxes.terminate(self._sandbox_id, snapshot=None)
+        with contextlib.suppress(Exception):
+            await self._sandbox.close()

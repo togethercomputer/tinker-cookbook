@@ -7,7 +7,7 @@ from tinker_cookbook.recipes.harbor_rl.train import CLIConfig, cli_main
 
 if __name__ == "__main__":
     tasks = load_harbor_tasks("terminal-bench-2.0")
-    task_name = "filter-js-from-html"  # change this to run a specific task
+    task_name = "fix-git"  # change this to run a specific task
     one_task = [t for t in tasks if t.task_name == task_name]
     if not one_task:
         raise ValueError(f"Task {task_name!r} not found. Available: {[t.task_name for t in tasks]}")
