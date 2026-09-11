@@ -3,9 +3,17 @@
 ## Installation
 
 ```bash
-uv pip install 'tinker-cookbook[together] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+uv pip install -e '.[together]'   # from a checkout of this repository
+
+export TINKER_API_KEY=...     # required for training and sampling
 export TOGETHER_API_KEY=...   # required for the Together Sandbox SDK
 ```
+
+Both keys are needed: the training loop talks to Tinker, and the sandboxes it
+grades in come from Together. If you run via `uv run` rather than the
+interpreter in `.venv`, refresh `uv.lock` first (`uv lock`) — a lock file
+predating the `together` extra pins an older `together-sandbox` and the backend
+will fail to import.
 
 RL training on Harbor formatted tasks (e.g., Terminal Bench 2.0) with sandboxed code execution. An agent gets a bash tool inside a sandboxed container, attempts a task, and receives reward based on test results.
 
@@ -82,6 +90,8 @@ async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterfa
 
 The first argument is the task's `environment/` directory (containing a Dockerfile and build context). Each backend converts this to its own image format internally. Together builds and registers a snapshot under a content-addressed alias, so repeated `create()` calls for the same build context reuse the cached image instead of rebuilding. Sandboxes carry a server-side TTL of `timeout` seconds, so they are reclaimed even if the training process dies.
 
+When a command exceeds its `command_timeout`, `run_command` returns the output the command produced before the deadline, with the reason in `stderr` and `exit_code` `-1`. The agent therefore sees *why* a command did not finish — the prompt it is blocked on, or a half-finished download — rather than an empty string, which is what makes such a failure recoverable within a rollout.
+
 `cli_main()` accepts an optional `sandbox_factory` parameter. When `None`, it falls back to `default_sandbox_factory` (Together). The factory flows through: `cli_main` -> `HarborDatasetBuilder` -> `HarborEnvGroupBuilder.make_envs()`.
 
 ## Running
@@ -92,10 +102,26 @@ First, download the Terminal-Bench tasks:
 uvx harbor datasets download terminal-bench@2.0 -o ~/.cache/harbor/tasks/terminal-bench-2.0/
 ```
 
+Then smoke-test the pipeline on a single task and a single step. This exercises
+the whole chain — snapshot build, sandbox creation, the bash tool, `test.sh`
+grading, one optimizer step — in a few minutes:
+
+```bash
+python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
+    model_name=moonshotai/Kimi-K2.6 \
+    group_size=2 \
+    groups_per_batch=1 \
+    max_steps=1 \
+    eval_every=0 \
+    max_tokens=2048 \
+    max_turns=10 \
+    command_timeout=90
+```
+
 Then launch training:
 
 ```bash
-uv run python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
+python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
     model_name=moonshotai/Kimi-K2.6 \
     max_tokens=8192 \
     group_size=4 \
@@ -104,6 +130,20 @@ uv run python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py 
     lora_rank=32 \
     wandb_project=cookbook_harbor_rl
 ```
+
+`group_size * groups_per_batch` sandboxes are live at once — 32 for the settings
+above — and each is held for up to `command_timeout` per turn, so start small
+and scale once a step's wall time and cost look right.
+
+Training writes to `log_path` (default `/tmp/tinker-examples/harbor_rl/<run_name>/`):
+`metrics.jsonl` for scalars, and `iteration_*/train_logtree.json` for full
+transcripts including every command the agent ran and its output.
+
+Watch `env/all/by_group/frac_mixed`. RL advantages are centered within a group,
+so a group whose rollouts all score the same contributes no gradient no matter
+how many steps you run. If `frac_mixed` sits at 0, the tasks in the batch are
+uniformly out of (or within) reach and the run is not learning — change the task
+mix or raise `group_size` rather than training longer.
 
 ## Evaluation
 
