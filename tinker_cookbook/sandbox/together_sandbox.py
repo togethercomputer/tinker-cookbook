@@ -296,39 +296,77 @@ class TogetherSandboxWrapper:
     ) -> SandboxResult:
         """Run a shell command in the sandbox.
 
-        Together returns combined stdout+stderr as a single ``output`` field;
-        we place it in ``SandboxResult.stdout`` and leave ``stderr`` empty.
-        Apply ``max_output_bytes`` as a post-hoc truncation.
+        The exec's output stream is consumed here rather than via
+        ``execs.exec()``, which only returns once the process exits. Driving it
+        directly keeps whatever the sandbox already sent when the command times
+        out or the stream drops, so a caller sees the command's real output
+        (a prompt it is blocked on, a half-finished download) instead of an
+        empty string.
+
+        Together delivers stdout and stderr interleaved on one stream, so the
+        combined text goes in ``SandboxResult.stdout``; ``stderr`` carries the
+        reason the command did not finish, when it did not.
         """
         cap = max_output_bytes if max_output_bytes is not None else self._max_stream_output_bytes
+        chunks: list[str] = []
+        total = 0
+        exit_code: int | None = None
+        unfinished = ""
+        exec_id: str | None = None
+
+        def collected() -> str:
+            output = "".join(chunks)
+            return output[:cap] if cap is not None and len(output) > cap else output
+
         try:
-            result = await asyncio.wait_for(
-                self._sandbox.execs.exec(
-                    "bash",
-                    ["-lc", command],
-                    cwd=workdir,
-                ),
-                timeout=timeout,
+            exec_item = await self._sandbox.execs.create(
+                "bash", ["-lc", command], cwd=workdir, autostart=True
             )
-            output = result.get("output", "") or ""
-            if cap is not None and len(output) > cap:
-                output = output[:cap]
-            # Compare against None rather than using `or`: a successful command
-            # reports exit_code 0, which is falsy.
-            exit_code = result.get("exit_code")
-            return SandboxResult(
-                stdout=output,
-                stderr="",
-                exit_code=-1 if exit_code is None else int(exit_code),
-            )
-        except TimeoutError:
-            return SandboxResult(
-                stdout="", stderr=f"command timed out after {timeout}s", exit_code=-1
-            )
+            exec_id = exec_item.id
+            stream = self._sandbox.execs.stream_output(exec_id)
+            deadline = asyncio.get_running_loop().time() + timeout
+
+            try:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        unfinished = f"command timed out after {timeout}s"
+                        break
+                    try:
+                        event = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
+                    except StopAsyncIteration:
+                        # Stream ended without an exit code: the process was
+                        # killed or the sandbox went away mid-command.
+                        unfinished = "command output stream ended without an exit code"
+                        break
+                    except TimeoutError:
+                        unfinished = f"command timed out after {timeout}s"
+                        break
+
+                    # Stop accumulating past the cap, but keep draining so the
+                    # exit code still arrives for a very chatty command.
+                    if cap is None or total < cap:
+                        text = event.get("output", "") or ""
+                        chunks.append(text)
+                        total += len(text)
+                    if isinstance(event.get("exitCode"), int):
+                        exit_code = event["exitCode"]
+                        break
+            finally:
+                await stream.aclose()
+
+            if exit_code is None:
+                # Leave nothing running in the sandbox once we have given up.
+                with contextlib.suppress(Exception):
+                    await self._sandbox.execs.delete(exec_id)
+                return SandboxResult(stdout=collected(), stderr=unfinished, exit_code=-1)
+
+            return SandboxResult(stdout=collected(), stderr="", exit_code=exit_code)
         except Exception as e:
             if _is_sandbox_terminated(e):
                 raise SandboxTerminatedError(str(e)) from e
-            return SandboxResult(stdout="", stderr=str(e), exit_code=-1)
+            # Surface partial output alongside the error for the same reason.
+            return SandboxResult(stdout=collected(), stderr=str(e), exit_code=-1)
 
     async def read_file(
         self, path: str, max_bytes: int | None = None, timeout: int = 60
