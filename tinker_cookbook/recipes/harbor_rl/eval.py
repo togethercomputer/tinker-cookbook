@@ -109,9 +109,7 @@ async def evaluate_task(
 
         trajectory = await do_single_rollout(policy, env)
         reward = sum(t.reward for t in trajectory.transitions)
-        reward_details = (
-            trajectory.transitions[-1].metrics if trajectory.transitions else {}
-        )
+        reward_details = trajectory.transitions[-1].metrics if trajectory.transitions else {}
         turns_used = len(trajectory.transitions)
         elapsed = time.monotonic() - start
 
@@ -207,9 +205,7 @@ async def run_eval(
             base_model=config.model_name,
         )
     else:
-        sampling_client = service_client.create_sampling_client(
-            base_model=config.model_name
-        )
+        sampling_client = service_client.create_sampling_client(base_model=config.model_name)
 
     tokenizer = tokenizer_utils.get_tokenizer(config.model_name)
     renderer_name = config.renderer_name or model_info.get_recommended_renderer_name(

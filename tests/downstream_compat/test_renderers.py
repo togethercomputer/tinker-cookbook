@@ -169,9 +169,16 @@ EXPECTED_RENDERER_NAMES = [
     "qwen3_instruct",
     "qwen3_5",
     "qwen3_5_disable_thinking",
+    "qwen3_8_xhigh_reasoning",
+    "qwen3_8_medium_reasoning",
+    "qwen3_8_low_reasoning",
+    "qwen3_8_disable_thinking",
     "deepseekv3",
     "deepseekv3_disable_thinking",
     "deepseekv3_thinking",
+    "glm5_3_max_reasoning",
+    "glm5_3_low_reasoning",
+    "glm5_3_high_reasoning",
     "kimi_k2",
     "kimi_k25",
     "kimi_k25_disable_thinking",
@@ -185,6 +192,9 @@ EXPECTED_RENDERER_NAMES = [
     "nemotron3",
     "nemotron3_low_thinking",
     "nemotron3_disable_thinking",
+    "nemotron3_ultra",
+    "nemotron3_ultra_disable_thinking",
+    "nemotron3_ultra_medium_thinking",
 ]
 
 

@@ -84,28 +84,30 @@ async def default_sandbox_factory(
     env_dir: Path,
     timeout: int,
     *,
-    cpu_millicores: int | None = None,
-    memory_mb: int | None = None,
-    disk_gb: int | None = None,
+    cpu_cores: float | None = None,
+    memory_bytes: int | None = None,
+    tags: dict[str, str] | None = None,
 ) -> SandboxInterface:
     """Create a Together sandbox from a task environment directory."""
     from tinker_cookbook.sandbox.together_sandbox import TogetherSandboxWrapper
     return await TogetherSandboxWrapper.create(
         env_dir=env_dir,
         timeout=timeout,
-        cpu_millicores=cpu_millicores,
-        memory_mb=memory_mb,
-        disk_gb=disk_gb,
+        cpu_cores=cpu_cores,
+        memory_bytes=memory_bytes,
+        tags=tags,
     )
 ```
 
 The first argument is the task's `environment/` directory (containing a Dockerfile and build context). Each backend converts this to its own image format internally (Together builds and registers a snapshot under a content-addressed alias, so repeated `create()` calls for the same Dockerfile reuse the cached image instead of rebuilding).
 
-`cpu_millicores` / `memory_mb` / `disk_gb` are also exposed on `HarborEnvGroupBuilder` and `HarborDatasetBuilder` so you can override Together's defaults (1000mC / 2048MB / 10GB) for resource-hungry tasks like SWE-Bench. Leave them as `None` to accept the defaults.
+`cpu_cores` / `memory_bytes` are also exposed on `HarborEnvGroupBuilder` and `HarborDatasetBuilder` so you can override Together's defaults (1 vCPU / 2 GiB) for resource-hungry tasks like SWE-Bench. Leave them as `None` to accept the defaults. Memory must be between 1 GB and 8 GB per requested core.
+
+Sandboxes and their snapshots are tagged for cost attribution (`user`, `job`, `component`, plus `recipe` and `task`). `user` comes from the OS login name; set `TINKER_SANDBOX_USER` to override it when running under a shared service account.
 
 `cli_main()` accepts an optional `sandbox_factory` parameter. When `None`, it falls back to `default_sandbox_factory` (Together). The factory flows through: `cli_main` -> `HarborDatasetBuilder` -> `HarborEnvGroupBuilder.make_envs()`.
 
-Together has no native VM-lifetime cap, so the wrapper schedules an in-process watchdog that calls `shutdown()` after `sandbox_timeout` seconds — always call `cleanup()` (already wired into `HarborEnvGroupBuilder.cleanup()` and `eval.py`'s finally-blocks) to release sandboxes promptly.
+Sandboxes are created with a server-side TTL of `sandbox_timeout` seconds, so they are reclaimed even if the training process dies. Still call `cleanup()` (already wired into `HarborEnvGroupBuilder.cleanup()` and `eval.py`'s finally-blocks) to release them promptly rather than waiting out the TTL. Termination is final — a sandbox cannot be restarted.
 
 ## Running
 
@@ -118,7 +120,14 @@ uvx harbor datasets download terminal-bench@2.0 -o ~/.cache/harbor/tasks/termina
 Then launch training:
 
 ```bash
-uv run python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py
+uv run python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
+    model_name=moonshotai/Kimi-K2.6 \
+    max_tokens=8192 \
+    group_size=4 \
+    groups_per_batch=8 \
+    learning_rate=1e-5 \
+    lora_rank=32 \
+    wandb_project=cookbook_harbor_rl
 ```
 
 ## Evaluation
@@ -135,22 +144,27 @@ uvx harbor datasets download swebench-verified@1.0 -o ~/.cache/harbor/tasks/sweb
 Run evaluation:
 
 ```bash
-uv run python tinker_cookbook/recipes/harbor_rl/scripts/eval_terminal_bench.py
+uv run python tinker_cookbook/recipes/harbor_rl/scripts/eval_harbor_rl.py \
+    checkpoint_url=tinker://YOUR_CHECKPOINT/sampler_weights/final \
+    benchmarks=terminal_bench,swe_bench \
+    max_turns=200 \
+    max_tokens=8192 \
+    temperature=1.0
 ```
 
-Key parameters in `EvalConfig`: `max_turns`, `max_tokens`, `temperature`.
+Key parameters in `EvalConfig`: `checkpoint_url`, `max_turns`, `max_tokens`, `temperature`.
 `run_eval()` also accepts `sandbox_factory` for custom sandbox backends and `output_path` to control where results are written (default: `tinker_cookbook/recipes/harbor_rl/scripts/results/<timestamp>/`).
 
 We evaluated SWE-Bench-Verified-1.0 and Terminal-Bench-2.0 at 32K context length and naive agent harness with no advanced features like context compatification that summarizes the tool calling history.
 
-### Results: Kimi-K2-Thinking (32K context, no compaction)
+### Results: Kimi-K2.6 (32K context, no compaction)
 
-| Benchmark              | Total | PASS       | FAIL       | ERROR       | Pass Rate |
-| ---------------------- | ----- | ---------- | ---------- | ----------- | --------- |
-| SWE-Bench Verified 1.0 | 500   | 46 (9.2%)  | 52 (10.4%) | 402 (80.4%) | 9.2%      |
-| Terminal-Bench 2.0     | 89    | 18 (20.2%) | 36 (40.4%) | 35 (39.3%)  | 20.2%     |
+| Benchmark              | Total | PASS        | FAIL       | ERROR       | Pass Rate |
+| ---------------------- | ----- | ----------- | ---------- | ----------- | --------- |
+| SWE-Bench Verified 1.0 | 500   | 145 (29.0%) | 52 (10.4%) | 303 (60.6%) | 29.0%     |
+| Terminal-Bench 2.0     | 89    | 14 (15.7%)  | 31 (34.8%) | 44 (49.4%)  | 15.7%     |
 
-**Config**: `max_turns=200, max_tokens=8192, temperature=0.1, sandbox_timeout=3600s`
+**Config**: `max_turns=200, max_tokens=8192, temperature=1.0, sandbox_timeout=3600s`
 
 All ERRORs are context window overflow (`prompt_tokens + max_tokens > 32768`).
 These occur when the conversation history exceeds ~24.5K tokens, leaving insufficient room for the 8192 `max_tokens` generation budget.
