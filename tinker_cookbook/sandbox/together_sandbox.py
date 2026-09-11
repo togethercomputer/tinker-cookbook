@@ -70,9 +70,19 @@ def _default_tags() -> dict[str, str]:
 
     ``user`` defaults to the OS login name; override it with
     ``TINKER_SANDBOX_USER`` when running under a shared service account.
+
+    ``run`` carries ``TINKER_SANDBOX_RUN`` when it is set, which training
+    entrypoints populate with their run name. It is what ties a sandbox back to
+    the run that created it — a run that dies without unwinding leaves its
+    sandboxes up until their TTL expires, and the tag is then the only way to
+    tell those apart from another run's live ones.
     """
     user = os.environ.get("TINKER_SANDBOX_USER") or getpass.getuser()
-    return {"user": user, "job": "tinker", "component": "tinker-cookbook"}
+    tags = {"user": user, "job": "tinker", "component": "tinker-cookbook"}
+    run = os.environ.get("TINKER_SANDBOX_RUN")
+    if run:
+        tags["run"] = run
+    return tags
 
 
 # Locks for de-duplicating concurrent snapshot builds within a single process.

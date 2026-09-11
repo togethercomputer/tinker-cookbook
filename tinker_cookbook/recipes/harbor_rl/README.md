@@ -92,6 +92,19 @@ async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterfa
 
 The first argument is the task's `environment/` directory (containing a Dockerfile and build context). Each backend converts this to its own image format internally. Together builds and registers a snapshot under a content-addressed alias, so repeated `create()` calls for the same build context reuse the cached image instead of rebuilding. Sandboxes carry a server-side TTL of `timeout` seconds, so they are reclaimed even if the training process dies.
 
+Each sandbox and snapshot is tagged `user` / `job` / `component`, plus `run`
+with the training run's name. A run that dies without unwinding leaves its
+sandboxes up until the TTL expires, and the `run` tag is what distinguishes
+those from another run's live ones:
+
+```python
+page = await sdk.sandboxes.list(statuses=["running"], tags={"run": "<run_name>"})
+```
+
+`user` comes from the OS login name; set `TINKER_SANDBOX_USER` to override it
+under a shared service account, and `TINKER_SANDBOX_RUN` to set the run name
+yourself.
+
 When a command exceeds its `command_timeout`, `run_command` returns the output the command produced before the deadline, with the reason in `stderr` and `exit_code` `-1`. The agent therefore sees *why* a command did not finish — the prompt it is blocked on, or a half-finished download — rather than an empty string, which is what makes such a failure recoverable within a rollout.
 
 `cli_main()` accepts an optional `sandbox_factory` parameter. When `None`, it falls back to `default_sandbox_factory` (Together). The factory flows through: `cli_main` -> `HarborDatasetBuilder` -> `HarborEnvGroupBuilder.make_envs()`.

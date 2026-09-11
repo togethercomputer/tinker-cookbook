@@ -1,6 +1,7 @@
 """CLI entry point for Harbor RL training."""
 
 import logging
+import os
 from datetime import datetime
 
 import chz
@@ -77,6 +78,10 @@ async def cli_main(
         f"{cli_config.groups_per_batch}batch-"
         f"{datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     )
+
+    # Published rather than passed so the sandbox backend, whichever one is
+    # injected, can tag what it creates with the run that asked for it.
+    os.environ.setdefault("TINKER_SANDBOX_RUN", run_name)
 
     log_path = cli_config.log_path or f"/tmp/tinker-examples/harbor_rl/{run_name}"
     wandb_name = cli_config.wandb_name or run_name
