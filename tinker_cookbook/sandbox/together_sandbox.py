@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # Cached snapshot aliases live under this prefix on Together's registry.
 SNAPSHOT_ALIAS_PREFIX = "tinker-cookbook-harbor"
 
+
 def _default_tags() -> dict[str, str]:
     """Tags attached to every sandbox and snapshot, for cost attribution.
 
@@ -82,11 +83,11 @@ _snapshot_build_locks_mu = asyncio.Lock()
 
 # One management-API client per process. Each client owns an httpx connection
 # pool, so creating one per sandbox would leak sockets across an RL run.
-_sdk: "ts.TogetherSandbox | None" = None
+_sdk: ts.TogetherSandbox | None = None
 _sdk_mu = asyncio.Lock()
 
 
-async def _get_sdk() -> "ts.TogetherSandbox":
+async def _get_sdk() -> ts.TogetherSandbox:
     """Return the process-wide SDK client, creating it on first use."""
     global _sdk
     async with _sdk_mu:
@@ -142,7 +143,7 @@ def _is_sandbox_terminated(exc: BaseException) -> bool:
 
 
 async def _ensure_snapshot(
-    sdk: "ts.TogetherSandbox", env_dir: Path, alias: str, tags: dict[str, str]
+    sdk: ts.TogetherSandbox, env_dir: Path, alias: str, tags: dict[str, str]
 ) -> str:
     """Look up a snapshot by alias; build one if it doesn't exist.
 
@@ -193,8 +194,8 @@ class TogetherSandboxWrapper:
 
     def __init__(
         self,
-        sdk: "ts.TogetherSandbox",
-        sandbox: "ts.Sandbox",
+        sdk: ts.TogetherSandbox,
+        sandbox: ts.Sandbox,
         snapshot_id: str,
         timeout: int,
         max_stream_output_bytes: int = 128 * 1024,
@@ -279,7 +280,7 @@ class TogetherSandboxWrapper:
                 self._sandbox.execs.exec("true", []),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         except Exception as e:
             if _is_sandbox_terminated(e):
@@ -320,7 +321,7 @@ class TogetherSandboxWrapper:
                 stderr="",
                 exit_code=-1 if exit_code is None else int(exit_code),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return SandboxResult(
                 stdout="", stderr=f"command timed out after {timeout}s", exit_code=-1
             )
@@ -340,7 +341,7 @@ class TogetherSandboxWrapper:
             if max_bytes is not None and len(content) > max_bytes:
                 content = content[:max_bytes]
             return SandboxResult(stdout=content, stderr="", exit_code=0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return SandboxResult(
                 stdout="", stderr=f"read_file timed out after {timeout}s", exit_code=-1
             )
@@ -393,7 +394,7 @@ class TogetherSandboxWrapper:
                         exit_code=exit_code,
                     )
             return SandboxResult(stdout="", stderr="", exit_code=0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return SandboxResult(
                 stdout="", stderr=f"write_file timed out after {timeout}s", exit_code=-1
             )
