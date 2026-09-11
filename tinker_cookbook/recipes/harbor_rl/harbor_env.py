@@ -59,18 +59,29 @@ class HarborTask:
 
 
 def load_harbor_tasks(dataset: str) -> list[HarborTask]:
-    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/."""
+    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/.
+
+    Handles both a flat layout (task directories directly under the dataset
+    directory) and the nested ``<shortuuid(task_id)>/<task-name>/`` layout the
+    harbor CLI writes, where the shortuuid level exists for deduplication.
+    """
     tasks_dir = HARBOR_CACHE_DIR / dataset
     tasks: list[HarborTask] = []
-    for task_dir in sorted(tasks_dir.iterdir()):
-        if not task_dir.is_dir():
+    for entry in sorted(tasks_dir.iterdir()):
+        if not entry.is_dir():
             continue
+        # Nested layout: descend through the shortuuid level to the task itself.
+        if not (entry / "instruction.md").exists():
+            subdirs = [d for d in entry.iterdir() if d.is_dir()]
+            if len(subdirs) != 1:
+                continue
+            entry = subdirs[0]
         tasks.append(
             HarborTask(
-                task_name=task_dir.name,
-                instruction=(task_dir / "instruction.md").read_text(),
-                task_dir=task_dir,
-                config=tomllib.loads((task_dir / "task.toml").read_text()),
+                task_name=entry.name,
+                instruction=(entry / "instruction.md").read_text(),
+                task_dir=entry,
+                config=tomllib.loads((entry / "task.toml").read_text()),
             )
         )
     tasks.sort(key=lambda t: t.task_name)

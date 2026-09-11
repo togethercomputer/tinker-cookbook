@@ -10,8 +10,8 @@ from tinker_cookbook.recipes.harbor_rl.harbor_env import (
 )
 
 DATASETS: dict[str, str] = {
-    "terminal_bench": "terminal-bench-2.0/terminal-bench",
-    "swe_bench": "swebench-verified-1.0/swebench-verified",
+    "terminal_bench": "terminal-bench-2.0",
+    "swe_bench": "swebench-verified-1.0",
 }
 
 

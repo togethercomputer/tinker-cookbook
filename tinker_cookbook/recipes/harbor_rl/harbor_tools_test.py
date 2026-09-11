@@ -5,6 +5,7 @@ import json
 import pickle
 from pathlib import Path
 
+from tinker_cookbook.recipes.harbor_rl import harbor_env
 from tinker_cookbook.recipes.harbor_rl.harbor_env import HarborEnvGroupBuilder, HarborTask
 from tinker_cookbook.recipes.harbor_rl.harbor_tools import (
     MAX_OUTPUT_CHARS,
@@ -252,3 +253,47 @@ class TestHarborEnvGroupBuilderPickle:
         assert restored.command_timeout == 60
         assert restored.grader_timeout == 30
         assert restored.max_trajectory_tokens == 16 * 1024
+
+
+class TestLoadHarborTasks:
+    """The harbor CLI nests tasks one level deeper than the dataset directory."""
+
+    def _write_task(self, task_dir: Path, name: str) -> None:
+        task_dir.mkdir(parents=True)
+        (task_dir / "instruction.md").write_text(f"do {name}")
+        (task_dir / "task.toml").write_text('version = "1.0"\n')
+
+    def test_flat_layout(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        self._write_task(tmp_path / "ds" / "alpha", "alpha")
+        self._write_task(tmp_path / "ds" / "beta", "beta")
+
+        tasks = harbor_env.load_harbor_tasks("ds")
+
+        assert [t.task_name for t in tasks] == ["alpha", "beta"]
+        assert tasks[0].instruction == "do alpha"
+        assert tasks[0].config == {"version": "1.0"}
+
+    def test_nested_shortuuid_layout(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        self._write_task(tmp_path / "ds" / "3aN2GgseP4MfXC7ixV7cXB" / "beta", "beta")
+        self._write_task(tmp_path / "ds" / "kzqjKVWxvHZxV5xyLNLqJi" / "alpha", "alpha")
+
+        tasks = harbor_env.load_harbor_tasks("ds")
+
+        # Sorted by task name, not by the shortuuid directory name.
+        assert [t.task_name for t in tasks] == ["alpha", "beta"]
+        assert tasks[0].task_dir.name == "alpha"
+        assert tasks[0].instruction == "do alpha"
+
+    def test_skips_entries_that_are_neither(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        self._write_task(tmp_path / "ds" / "hash1" / "alpha", "alpha")
+        # An ambiguous entry with several subdirectories and no instruction.md.
+        (tmp_path / "ds" / "ambiguous" / "one").mkdir(parents=True)
+        (tmp_path / "ds" / "ambiguous" / "two").mkdir(parents=True)
+        (tmp_path / "ds" / "stray.txt").write_text("not a task")
+
+        tasks = harbor_env.load_harbor_tasks("ds")
+
+        assert [t.task_name for t in tasks] == ["alpha"]
