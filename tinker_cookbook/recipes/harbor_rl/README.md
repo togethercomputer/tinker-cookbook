@@ -10,10 +10,12 @@ export TOGETHER_API_KEY=...   # required for the Together Sandbox SDK
 ```
 
 Both keys are needed: the training loop talks to Tinker, and the sandboxes it
-grades in come from Together. If you run via `uv run` rather than the
-interpreter in `.venv`, refresh `uv.lock` first (`uv lock`) — a lock file
-predating the `together` extra pins an older `together-sandbox` and the backend
-will fail to import.
+grades in come from Together.
+
+The commands below pass `--extra together` because `uv run` resyncs the
+environment from `uv.lock` and would otherwise drop the extra. Run `uv lock`
+once if your lock file predates that extra, or it pins an older
+`together-sandbox` and the backend fails to import.
 
 RL training on Harbor formatted tasks (e.g., Terminal Bench 2.0) with sandboxed code execution. An agent gets a bash tool inside a sandboxed container, attempts a task, and receives reward based on test results.
 
@@ -107,7 +109,7 @@ the whole chain — snapshot build, sandbox creation, the bash tool, `test.sh`
 grading, one optimizer step — in a few minutes:
 
 ```bash
-python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
+uv run --extra together python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
     model_name=moonshotai/Kimi-K2.6 \
     group_size=2 \
     groups_per_batch=1 \
@@ -121,7 +123,7 @@ python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
 Then launch training:
 
 ```bash
-python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
+uv run --extra together python tinker_cookbook/recipes/harbor_rl/scripts/train_terminal_bench.py \
     model_name=moonshotai/Kimi-K2.6 \
     max_tokens=8192 \
     group_size=4 \
@@ -157,7 +159,7 @@ uvx harbor datasets download swebench-verified@1.0 -o ~/.cache/harbor/tasks/sweb
 
 Run evaluation:
 ```bash
-uv run python tinker_cookbook/recipes/harbor_rl/scripts/eval_harbor_rl.py \
+uv run --extra together python tinker_cookbook/recipes/harbor_rl/scripts/eval_harbor_rl.py \
     checkpoint_url=tinker://YOUR_CHECKPOINT/sampler_weights/final \
     benchmarks=terminal_bench,swe_bench \
     max_turns=200 \
