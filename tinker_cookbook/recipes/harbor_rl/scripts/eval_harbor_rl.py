@@ -9,11 +9,9 @@ from tinker_cookbook.recipes.harbor_rl.harbor_env import (
     load_harbor_tasks,
 )
 
-# Dataset roots under ~/.cache/harbor/tasks. `load_harbor_tasks` walks the
-# nested <shortuuid>/<task-name>/ layout the harbor CLI writes.
 DATASETS: dict[str, str] = {
-    "terminal_bench": "terminal-bench-2.0",
-    "swe_bench": "swebench-verified-1.0",
+    "terminal_bench": "terminal-bench-2.0/terminal-bench",
+    "swe_bench": "swebench-verified-1.0/swebench-verified",
 }
 
 

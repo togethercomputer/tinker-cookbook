@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 class EvalConfig:
     """Configuration for Harbor evaluation."""
 
-    model_name: str = "deepseek-ai/DeepSeek-V3.1"
+    model_name: str = "moonshotai/Kimi-K2.6"
     output_path: str = "tinker_cookbook/recipes/harbor_rl/scripts/results"
     max_turns: int = 10
     max_tokens: int = 2048
@@ -181,7 +181,7 @@ async def run_eval(
     Args:
         config: Evaluation configuration.
         tasks: List of HarborTask to evaluate.
-        sandbox_factory: Factory for creating sandboxes (defaults to Together).
+        sandbox_factory: Factory for creating sandboxes (defaults to Modal).
 
     Returns:
         List of per-task results.

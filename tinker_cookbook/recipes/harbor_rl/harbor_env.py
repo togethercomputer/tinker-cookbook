@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import tomllib
 from collections.abc import Awaitable, Callable, Sequence
@@ -30,20 +29,10 @@ HARBOR_SYSTEM_PROMPT = (
     "Complete the task described by the user."
 )
 
-# SandboxFactory is intentionally typed as Callable[..., ...] (rather than a
-# fixed positional signature) so backends can accept additional resource
-# kwargs (cpu/memory/disk) without breaking callers that don't supply them.
-SandboxFactory = Callable[..., Awaitable[SandboxInterface]]
+SandboxFactory = Callable[[Path, int], Awaitable[SandboxInterface]]
 
 
-async def default_sandbox_factory(
-    env_dir: Path,
-    timeout: int,
-    *,
-    cpu_cores: float | None = None,
-    memory_bytes: int | None = None,
-    tags: dict[str, str] | None = None,
-) -> SandboxInterface:
+async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterface:
     """Create a Together sandbox from a task environment directory.
 
     Snapshots are cached on Together's registry under a hash of the build
@@ -53,19 +42,10 @@ async def default_sandbox_factory(
     Args:
         env_dir: Path to the task's environment/ directory (must contain a Dockerfile).
         timeout: Sandbox lifetime in seconds, enforced server-side as a TTL.
-        cpu_cores: CPU allocation in cores. None uses Together's default (1 vCPU).
-        memory_bytes: Memory allocation in bytes. None uses Together's default (2 GiB).
-        tags: Extra key/value labels for cost attribution (e.g. recipe, task).
     """
     from tinker_cookbook.sandbox.together_sandbox import TogetherSandboxWrapper
 
-    return await TogetherSandboxWrapper.create(
-        env_dir=env_dir,
-        timeout=timeout,
-        cpu_cores=cpu_cores,
-        memory_bytes=memory_bytes,
-        tags=tags,
-    )
+    return await TogetherSandboxWrapper.create(env_dir=env_dir, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -79,30 +59,18 @@ class HarborTask:
 
 
 def load_harbor_tasks(dataset: str) -> list[HarborTask]:
-    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/.
-
-    Handles both flat layouts (task files directly in task_dir) and nested
-    layouts where each entry contains a single named subdirectory
-    (e.g. <hash>/<task-name>/instruction.md).
-    """
+    """Load Harbor tasks from ~/.cache/harbor/tasks/<dataset>/."""
     tasks_dir = HARBOR_CACHE_DIR / dataset
     tasks: list[HarborTask] = []
-    for entry in sorted(tasks_dir.iterdir()):
-        if not entry.is_dir():
+    for task_dir in sorted(tasks_dir.iterdir()):
+        if not task_dir.is_dir():
             continue
-        # Nested layout: <hash>/<task-name>/
-        if not (entry / "instruction.md").exists():
-            subdirs = [d for d in entry.iterdir() if d.is_dir()]
-            if len(subdirs) == 1:
-                entry = subdirs[0]
-            else:
-                continue
         tasks.append(
             HarborTask(
-                task_name=entry.name,
-                instruction=(entry / "instruction.md").read_text(),
-                task_dir=entry,
-                config=tomllib.loads((entry / "task.toml").read_text()),
+                task_name=task_dir.name,
+                instruction=(task_dir / "instruction.md").read_text(),
+                task_dir=task_dir,
+                config=tomllib.loads((task_dir / "task.toml").read_text()),
             )
         )
     tasks.sort(key=lambda t: t.task_name)
@@ -124,13 +92,7 @@ def _initial_messages(
 
 
 class HarborEnvGroupBuilder(EnvGroupBuilder):
-    """EnvGroupBuilder that creates Harbor environments with Together sandboxes.
-
-    Resource allocation for the underlying sandbox is configurable via the
-    ``cpu_cores`` / ``memory_bytes`` fields, which are forwarded to the sandbox
-    factory. Leaving them as ``None`` accepts the backend's defaults
-    (Together: 1 vCPU / 2 GiB).
-    """
+    """EnvGroupBuilder that creates Harbor environments with Modal sandboxes."""
 
     def __init__(
         self,
@@ -147,8 +109,6 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
         context_overflow_reward: float = -0.1,
         sandbox_factory: SandboxFactory | None = None,
         reward_fn: RewardFn | None = None,
-        cpu_cores: float | None = None,
-        memory_bytes: int | None = None,
     ):
         self.task = task
         self.model_name = model_name
@@ -163,8 +123,6 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
         self.context_overflow_reward = context_overflow_reward
         self.sandbox_factory = sandbox_factory or default_sandbox_factory
         self.reward_fn = reward_fn
-        self.cpu_cores = cpu_cores
-        self.memory_bytes = memory_bytes
         self._sandboxes: list[SandboxInterface] = []
 
     async def make_envs(self) -> Sequence[Env]:
@@ -181,33 +139,11 @@ class HarborEnvGroupBuilder(EnvGroupBuilder):
 
         tests_dir = self.task.task_dir / "tests"
 
-        # All rollouts in a group share one snapshot, so create their sandboxes
-        # concurrently — serial creation dominates step time at larger
-        # group_size. The first caller builds the snapshot; the rest wait on the
-        # in-process build lock and reuse it.
-        results = await asyncio.gather(
-            *(
-                self.sandbox_factory(
-                    env_dir,
-                    self.sandbox_timeout,
-                    cpu_cores=self.cpu_cores,
-                    memory_bytes=self.memory_bytes,
-                    tags={"recipe": "harbor_rl", "task": self.task.task_name},
-                )
-                for _ in range(self.group_size)
-            ),
-            return_exceptions=True,
-        )
-        # Record what did come up before re-raising, so a partial failure does
-        # not orphan running sandboxes until their TTL expires.
-        self._sandboxes = [r for r in results if not isinstance(r, BaseException)]
-        failures = [r for r in results if isinstance(r, BaseException)]
-        if failures:
-            await self.cleanup()
-            raise failures[0]
-
         envs = []
-        for sandbox in self._sandboxes:
+        for _ in range(self.group_size):
+            sandbox = await self.sandbox_factory(env_dir, self.sandbox_timeout)
+            self._sandboxes.append(sandbox)
+
             bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
             reward_fn = self.reward_fn or HarborReward(
                 tests_dir=tests_dir,
@@ -278,8 +214,6 @@ class HarborDatasetBuilder(RLDatasetBuilder):
     context_overflow_reward: float = -0.1
     sandbox_factory: SandboxFactory | None = None
     reward_fn: RewardFn | None = None
-    cpu_cores: float | None = None
-    memory_bytes: int | None = None
 
     def _make_env_group_builders(self, group_size: int) -> list[HarborEnvGroupBuilder]:
         return [
@@ -297,8 +231,6 @@ class HarborDatasetBuilder(RLDatasetBuilder):
                 context_overflow_reward=self.context_overflow_reward,
                 sandbox_factory=self.sandbox_factory,
                 reward_fn=self.reward_fn,
-                cpu_cores=self.cpu_cores,
-                memory_bytes=self.memory_bytes,
             )
             for task in self.tasks
         ]
