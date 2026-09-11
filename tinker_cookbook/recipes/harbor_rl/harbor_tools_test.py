@@ -5,6 +5,8 @@ import json
 import pickle
 from pathlib import Path
 
+import pytest
+
 from tinker_cookbook.recipes.harbor_rl import harbor_env
 from tinker_cookbook.recipes.harbor_rl.harbor_env import HarborEnvGroupBuilder, HarborTask
 from tinker_cookbook.recipes.harbor_rl.harbor_tools import (
@@ -289,7 +291,7 @@ class TestLoadHarborTasks:
     def test_skips_entries_that_are_neither(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
         self._write_task(tmp_path / "ds" / "hash1" / "alpha", "alpha")
-        # An ambiguous entry with several subdirectories and no instruction.md.
+        # Directories that are not tasks: no task.toml anywhere beneath them.
         (tmp_path / "ds" / "ambiguous" / "one").mkdir(parents=True)
         (tmp_path / "ds" / "ambiguous" / "two").mkdir(parents=True)
         (tmp_path / "ds" / "stray.txt").write_text("not a task")
@@ -297,3 +299,41 @@ class TestLoadHarborTasks:
         tasks = harbor_env.load_harbor_tasks("ds")
 
         assert [t.task_name for t in tasks] == ["alpha"]
+
+    def test_extra_dataset_level(self, tmp_path: Path, monkeypatch) -> None:
+        """`harbor download -o <dir>/` can nest tasks one level deeper."""
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        root = tmp_path / "terminal-bench-2.0" / "terminal-bench"
+        self._write_task(root / "3aN2GgseP4MfXC7ixV7cXB" / "beta", "beta")
+        self._write_task(root / "kzqjKVWxvHZxV5xyLNLqJi" / "alpha", "alpha")
+
+        tasks = harbor_env.load_harbor_tasks("terminal-bench-2.0")
+
+        assert [t.task_name for t in tasks] == ["alpha", "beta"]
+        assert tasks[0].task_dir.name == "alpha"
+
+    def test_fixture_dirs_inside_a_task_are_not_tasks(self, tmp_path: Path, monkeypatch) -> None:
+        """An instruction.md inside a task's fixtures must not create a task."""
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        task = tmp_path / "ds" / "hash1" / "alpha"
+        self._write_task(task, "alpha")
+        (task / "tests" / "fixture").mkdir(parents=True)
+        (task / "tests" / "fixture" / "instruction.md").write_text("not a task")
+
+        tasks = harbor_env.load_harbor_tasks("ds")
+
+        assert [t.task_name for t in tasks] == ["alpha"]
+
+    def test_missing_dataset_raises(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+
+        with pytest.raises(FileNotFoundError, match="No Harbor dataset"):
+            harbor_env.load_harbor_tasks("absent")
+
+    def test_empty_dataset_raises(self, tmp_path: Path, monkeypatch) -> None:
+        """Silently returning nothing lets training 'succeed' with no rollouts."""
+        monkeypatch.setattr(harbor_env, "HARBOR_CACHE_DIR", tmp_path)
+        (tmp_path / "ds" / "not-a-task").mkdir(parents=True)
+
+        with pytest.raises(FileNotFoundError, match="Found no Harbor tasks"):
+            harbor_env.load_harbor_tasks("ds")
