@@ -115,10 +115,16 @@ uv run --extra together python tinker_cookbook/recipes/harbor_rl/scripts/train_t
     groups_per_batch=1 \
     max_steps=1 \
     eval_every=0 \
-    max_tokens=2048 \
+    max_tokens=8192 \
     max_turns=10 \
     command_timeout=90
 ```
+
+Keep `max_tokens` at the value you intend to train with. A reasoning model
+spends part of each turn's budget before it emits a tool call, so a budget that
+is too small truncates the turn mid-thought: the rollout ends on
+`stop/max_tokens` having issued no commands at all, and the episode scores
+`context_overflow_reward` without the task ever being attempted.
 
 Then launch training:
 
